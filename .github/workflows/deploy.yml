@@ -206,44 +206,20 @@ jobs:
       - name: Resolve RDS endpoint
         id: rds
         env:
-          DEFAULT_PORT: "3306"
-          PROJECT:      ${{ secrets.PROJECT_NAME }}
+          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
         run: |
-          # We resolve the endpoint here (in the configure job) rather than
-          # publishing it as a provision-job output. GHA scrubs job outputs
-          # whose values contain registered secret substrings — and an RDS
-          # endpoint embeds the project name, which itself is registered as
-          # a secret. So passing it via outputs silently zeroed the value.
-          ALL_INSTANCES=$(aws rds describe-db-instances --output json 2>&1) || {
-            echo "::error title=RDS describe failed::$ALL_INSTANCES"
-            exit 1
-          }
-          MATCH=$(echo "$ALL_INSTANCES" | jq -r --arg p "$PROJECT" \
-            '.DBInstances[]
-               | select(
-                   (.DBInstanceIdentifier == ($p + "-db"))
-                   or (.DBInstanceIdentifier == $p)
-                   or ((.TagList // []) | any(.Key == "Project" and .Value == $p))
-                 )
-               | [.Endpoint.Address, (.Endpoint.Port|tostring)]
-               | @tsv' \
-            | head -n 1)
-          ENDPOINT=""
-          PORT=""
-          if [ -n "$MATCH" ]; then
-            ENDPOINT=$(printf '%s' "$MATCH" | cut -f1)
-            PORT=$(printf '%s' "$MATCH" | cut -f2)
-          fi
-          PORT="${PORT:-$DEFAULT_PORT}"
-          if [ -z "$ENDPOINT" ]; then
-            echo "::error title=RDS endpoint missing::Could not find an RDS instance for project $PROJECT in region ${{ secrets.AWS_REGION }}. Make sure terraform apply created the aws_db_instance and that AWS_REGION matches the region it was created in."
+          ENDPOINT=$(aws rds describe-db-instances \
+            --query "DBInstances[?contains(DBInstanceIdentifier, \`${PROJECT_NAME}\`)].Endpoint.Address | [0]" \
+            --output text 2>/dev/null || echo "")
+          PORT=$(aws rds describe-db-instances \
+            --query "DBInstances[?contains(DBInstanceIdentifier, \`${PROJECT_NAME}\`)].Endpoint.Port | [0]" \
+            --output text 2>/dev/null || echo "5432")
+          if [ -z "$ENDPOINT" ] || [ "$ENDPOINT" = "None" ]; then
+            echo "::error title=RDS endpoint not found::Could not resolve RDS endpoint for project ${PROJECT_NAME}. Check the configure job log."
             exit 1
           fi
-          # Step outputs in the SAME job are not scrubbed against secret
-          # values, so it is safe to write the endpoint here.
-          echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
-          echo "port=$PORT"         >> $GITHUB_OUTPUT
-          # Sanitized echo for the workflow log.
+          echo "endpoint=${ENDPOINT}" >> $GITHUB_OUTPUT
+          echo "port=${PORT}" >> $GITHUB_OUTPUT
           echo "Resolved RDS endpoint OK (port=$PORT)"
       - name: Run Ansible playbook
         working-directory: ansible
@@ -278,6 +254,10 @@ jobs:
             echo "::error title=RDS endpoint missing::Resolve RDS endpoint step did not produce an endpoint. Aborting before we deploy a localhost-bound app."
             exit 1
           fi
+          # Construct the database URL from the resolved RDS endpoint and credentials.
+          : "${DEPLOY_RDS_PORT:=5432}"
+          : "${DEPLOY_DB_TYPE:=postgresql}"
+          DEPLOY_DATABASE_URL="${DEPLOY_DB_TYPE}://${DEPLOY_DB_USERNAME}:${DEPLOY_DB_PASSWORD}@${DEPLOY_RDS_ENDPOINT}:${DEPLOY_RDS_PORT}/${DEPLOY_DB_NAME}"
           EXTRA_VARS+=(-e "deploy_database_url=${DEPLOY_DATABASE_URL}")
           EXTRA_VARS+=(-e "deploy_db_name=${DEPLOY_DB_NAME}")
           EXTRA_VARS+=(-e "deploy_db_username=${DEPLOY_DB_USERNAME}")
